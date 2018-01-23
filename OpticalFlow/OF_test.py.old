@@ -1,0 +1,509 @@
+import sys, os, numpy as np
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../flownet2-tf")
+from MovieGenerator.MovieGenerator import GenerateMovie
+from src.flownet2.flownet2 import FlowNet2
+from src.net import Mode
+# from src.training_schedules import LONG_SCHEDULE
+#import tensorflow as tf
+# from skimage.feature import corner_harris, corner_subpix, corner_peaks
+# from PIL import Image, ImageOps
+import keras
+from crfasrnn_keras.ImageSegmentation import ImageSegmenter
+import matplotlib.animation as animation
+from pylab import *
+
+np.random.seed(400582833)
+checkpoint='../flownet2-tf/checkpoints/FlowNet2/flownet-2.ckpt-0'
+dpi = 100
+
+fig = plt.figure()
+axes = fig.add_subplot(121)
+axes2 = fig.add_subplot(122)
+axes.set_aspect('equal')
+axes.get_xaxis().set_visible(False)
+axes.get_yaxis().set_visible(False)
+axes2.set_aspect('equal')
+axes2.get_xaxis().set_visible(False)
+axes2.get_yaxis().set_visible(False)
+
+movie, _ = GenerateMovie(GenImSize=(256, 256), numFrames=16, numCells=64, InitVelSD=2, VelScaleSD=1, AngleSDRad=np.radians(20),
+                radius_mean=7, radius_sd=1, radius_min=6, radius_max=10, WriteMovieFile=False)
+
+h, w, n = (int(s) for s in movie.shape)
+
+name = 'demo.mp4'
+fps = 5
+im = axes.imshow(movie[:, :, 0],cmap='gray',interpolation='nearest')
+im.set_clim([0,1])
+im2 = axes2.imshow((255 * np.ones((h, w, 3))).astype('uint8'))
+fig.set_size_inches([10,5])
+
+tight_layout()
+
+def draw_flow_lines(flow, step=16):
+    y, x = np.mgrid[step/2:h:step, step/2:w:step].reshape(2,-1).astype(int)
+    fx, fy = flow[y,x].T
+    lines = np.vstack([x, y, fx, fy]).T.reshape(-1, 2, 2)
+    return lines
+
+def draw_tracks(tracks, t):
+    lines = []
+
+    if t > 0:
+        x1 = []
+        y1 = []
+        x2 = []
+        y2 = []
+
+        for track in tracks:
+            trackLen = track.t + len(track.mx)
+            if trackLen >= t:
+                trackT = t - track.t
+                if trackT == 1:
+                    x1.append(float(track.mox))
+                    y1.append(float(track.moy))
+                else:
+                    x1.append(track.mx[trackT - 2])
+                    y1.append(track.my[trackT - 2])
+
+                x2.append(track.mx[trackT - 1] - x1[-1])
+                y2.append(track.my[trackT - 1] - y1[-1])
+
+        if len(x1) > 0:
+            lines = np.vstack([x1, y1, x2, y2]).T.reshape(-1, 2, 2)
+
+    return lines
+
+
+prevDrawList = []
+# TODO: This is a hack, we should get rid of this
+# training_schedule = LONG_SCHEDULE
+boxProps_frame = dict(boxstyle='square', facecolor='grey', alpha=1)
+
+UNKNOWN_FLOW_THRESH = 1e7
+SMALLFLOW = 0.0
+LARGEFLOW = 1e8
+
+def compute_color(u, v):
+    """
+    compute optical flow color map
+    :param u: optical flow horizontal map
+    :param v: optical flow vertical map
+    :return: optical flow in color code
+    """
+    [h, w] = u.shape
+    img = np.zeros([h, w, 3])
+    nanIdx = np.isnan(u) | np.isnan(v)
+    u[nanIdx] = 0
+    v[nanIdx] = 0
+
+    colorwheel = make_color_wheel()
+    ncols = np.size(colorwheel, 0)
+
+    rad = np.sqrt(u**2+v**2)
+
+    a = np.arctan2(-v, -u) / np.pi
+
+    fk = (a+1) / 2 * (ncols - 1) + 1
+
+    k0 = np.floor(fk).astype(int)
+
+    k1 = k0 + 1
+    k1[k1 == ncols+1] = 1
+    f = fk - k0
+
+    for i in range(0, np.size(colorwheel,1)):
+        tmp = colorwheel[:, i]
+        col0 = tmp[k0-1] / 255
+        col1 = tmp[k1-1] / 255
+        col = (1-f) * col0 + f * col1
+
+        idx = rad <= 1
+        col[idx] = 1-rad[idx]*(1-col[idx])
+        notidx = np.logical_not(idx)
+
+        col[notidx] *= 0.75
+        img[:, :, i] = np.uint8(np.floor(255 * col*(1-nanIdx)))
+
+    return img
+
+
+def make_color_wheel():
+    """
+    Generate color wheel according Middlebury color code
+    :return: Color wheel
+    """
+    RY = 15
+    YG = 6
+    GC = 4
+    CB = 11
+    BM = 13
+    MR = 6
+
+    ncols = RY + YG + GC + CB + BM + MR
+
+    colorwheel = np.zeros([ncols, 3])
+
+    col = 0
+
+    # RY
+    colorwheel[0:RY, 0] = 255
+    colorwheel[0:RY, 1] = np.transpose(np.floor(255*np.arange(0, RY) / RY))
+    col += RY
+
+    # YG
+    colorwheel[col:col+YG, 0] = 255 - np.transpose(np.floor(255*np.arange(0, YG) / YG))
+    colorwheel[col:col+YG, 1] = 255
+    col += YG
+
+    # GC
+    colorwheel[col:col+GC, 1] = 255
+    colorwheel[col:col+GC, 2] = np.transpose(np.floor(255*np.arange(0, GC) / GC))
+    col += GC
+
+    # CB
+    colorwheel[col:col+CB, 1] = 255 - np.transpose(np.floor(255*np.arange(0, CB) / CB))
+    colorwheel[col:col+CB, 2] = 255
+    col += CB
+
+    # BM
+    colorwheel[col:col+BM, 2] = 255
+    colorwheel[col:col+BM, 0] = np.transpose(np.floor(255*np.arange(0, BM) / BM))
+    col += + BM
+
+    # MR
+    colorwheel[col:col+MR, 2] = 255 - np.transpose(np.floor(255 * np.arange(0, MR) / MR))
+    colorwheel[col:col+MR, 0] = 255
+
+    return colorwheel
+
+def flow_to_image(flow):
+    """
+    Convert flow into middlebury color code image
+    :param flow: optical flow map
+    :return: optical flow image in middlebury color
+    """
+    u = flow[:, :, 0]
+    v = flow[:, :, 1]
+
+    maxu = -999.
+    maxv = -999.
+    minu = 999.
+    minv = 999.
+
+    idxUnknow = (abs(u) > UNKNOWN_FLOW_THRESH) | (abs(v) > UNKNOWN_FLOW_THRESH)
+    u[idxUnknow] = 0
+    v[idxUnknow] = 0
+
+    maxu = max(maxu, np.max(u))
+    minu = min(minu, np.min(u))
+
+    maxv = max(maxv, np.max(v))
+    minv = min(minv, np.min(v))
+
+    rad = np.sqrt(u ** 2 + v ** 2)
+    maxrad = max(-1, np.max(rad))
+
+    #print("max flow: %.4f\nflow range:\nu = %.3f .. %.3f\nv = %.3f .. %.3f" % (maxrad, minu,maxu, minv, maxv))
+
+    u = u/(maxrad + np.finfo(float).eps)
+    v = v/(maxrad + np.finfo(float).eps)
+
+    img = compute_color(u, v)
+
+    idx = np.repeat(idxUnknow[:, :, np.newaxis], 3, axis=2)
+    img[idx] = 0
+
+    return np.uint8(img)
+
+fnet = FlowNet2(mode=Mode.TEST)
+
+class Track(object):
+    def __init__(self, mox=0, moy=0, t=0):
+        self.mox = mox
+        self.moy = moy
+        self.t = t
+        self.mx = []
+        self.my = []
+        self.stopped = False
+
+tracks = []
+
+def recursiveSmoothX(matrix, sigma):
+    vals1 = np.zeros(w)
+    vals2 = np.zeros(w)
+    alpha = 2.5 / (np.sqrt(np.pi) * sigma)
+    exp = np.exp(-alpha)
+    expSqr = exp * exp
+    twoExp = 2.0 * exp
+    k = (1.0 - exp) * (1.0 - exp) / (1.0 + (twoExp * alpha) - expSqr)
+    preMinus = exp * (alpha - 1.0)
+    prePlus = exp * (alpha + 1.0)
+    for y in range(h):
+        vals1[0] = (0.5 - (k * preMinus)) * matrix[y, 0]
+        vals1[1] = (k * (matrix[y, 1] + (preMinus * matrix[y, 0]))) + ((twoExp - expSqr) * vals1[0])
+        for x in range(2, w):
+            vals1[x] = (k * (matrix[y, x] + (preMinus * matrix[y, x - 1]))) + (twoExp * vals1[x - 1]) - (expSqr * vals1[x - 2])
+        vals2[w - 1] = (0.5 + (k * preMinus)) * matrix[y, w - 1]
+        vals2[w - 2] = (k * ((prePlus - expSqr) * matrix[y, w - 1])) + ((twoExp - expSqr) * vals2[w - 1])
+        for x in range(w - 3, -1, -1):
+            vals2[x] = (k * ((prePlus * matrix[y, x + 1]) - (expSqr * matrix[y, x + 2]))) + (twoExp * vals2[x + 1]) - (expSqr * vals2[x + 2])
+        for x in range(w):
+            matrix[y, x] = vals1[x] + vals2[x]
+
+def recursiveSmoothY(matrix, sigma):
+    vals1 = np.zeros(h)
+    vals2 = np.zeros(h)
+    alpha = 2.5 / (np.sqrt(np.pi) * sigma)
+    exp = np.exp(-alpha)
+    expSqr = exp * exp
+    twoExp = 2.0 * exp
+    k = (1.0 - exp) * (1.0 - exp) / (1.0 + (twoExp * alpha) - expSqr)
+    preMinus = exp * (alpha - 1.0)
+    prePlus = exp * (alpha + 1.0)
+    for x in range(w):
+        vals1[0] = (0.5 - (k * preMinus)) * matrix[x, 0]
+        vals1[1] = (k * (matrix[1, x] + (preMinus * matrix[0, x]))) + ((twoExp - expSqr) * vals1[0])
+        for y in range(2, h):
+            vals1[y] = (k * (matrix[y, x] + (preMinus * matrix[y - 1, x]))) + ((twoExp * vals1[y - 1]) - (expSqr * vals1[y - 2]))
+        vals2[h - 1] = (0.5 + (k * preMinus)) * matrix[h - 1, x]
+        vals2[h - 2] = (k * ((prePlus - expSqr) * matrix[h - 1, x])) + ((twoExp - expSqr) * vals2[h - 1])
+        for y in range(h - 3, -1, -1):
+            vals2[y] = (k * ((prePlus * matrix[y + 1, x]) - (expSqr * matrix[y + 2, x]))) + ((twoExp * vals2[y + 1]) - (expSqr * vals2[y + 2]))
+        for y in range(h):
+            matrix[y, x] = vals1[y] + vals2[y]
+
+def recursiveSmooth(matrix, sigma):
+    recursiveSmoothX(matrix, sigma)
+    recursiveSmoothY(matrix, sigma)
+
+def computeCorners(image, rho):
+    corners = np.zeros(image.shape)
+
+    dy, dx = np.gradient(image, axis=(0, 1))
+    dxx = dx * dx
+    dyy = dy * dy
+    dxy = dx * dy
+
+    recursiveSmooth(dxx, rho)
+    recursiveSmooth(dyy, rho)
+    recursiveSmooth(dxy, rho)
+    
+    # temp = 0.5 * (dxx + dyy)
+    # temp2 = (temp * temp) + (dxy * dxy) - (dxx * dyy)
+    # select = temp2 > 0
+    # corners[select] = temp[select] + np.sqrt(temp2[select])
+    eigen, _ = np.linalg.eig(np.concatenate((np.concatenate((dxx[..., np.newaxis], dxy[..., np.newaxis]), axis=2)[..., np.newaxis], 
+        np.concatenate((dxy[..., np.newaxis], dyy[..., np.newaxis]), axis=2)[..., np.newaxis]), axis=3))
+    select = np.logical_and(eigen[..., 0] > eigen[..., 1], eigen[..., 1] > 0)
+    corners[select] = eigen[select, 0]
+
+    return corners
+
+# Code fragment from Pedro Felzenszwalb  ---------------
+# http://people.cs.uchicago.edu/~pff/dt/
+def dt(f, n):
+    d = np.zeros(n)
+    v = np.zeros(n).astype(np.int32)
+    z = np.zeros(n + 1)
+    k = 0
+    v[0] = 0
+    z[0] = -10e20
+    z[1] = 10e20
+    
+    for q in range(1, n):
+        s  = ((f[q] + (q * q)) - (f[v[k]] + (v[k] * v[k]))) / (2.0 * (q - v[k]))
+        while s <= z[k]:
+            k -= 1
+            s  = ((f[q] + (q * q)) - (f[v[k]] + (v[k] * v[k]))) / (2.0 * (q - v[k]))
+        k += 1
+        v[k] = q
+        z[k] = s
+        z[k + 1] = 10e20
+
+    k = 0
+    for q in range(n):
+        while z[k + 1] < q:
+            k += 1
+        tmp =  q - v[k]
+        d[q] = (tmp * tmp) + f[v[k]]
+
+    return d
+
+def euclideanDistanceTransform(matrix):
+    xSize = matrix.shape[1]
+    ySize = matrix.shape[0]
+    
+    # Transform along columns
+    for y in range(ySize):
+        f = matrix[y, :]
+        d = dt(f, ySize)
+        matrix[y, :] = d
+
+    # Transform along rows
+    for x in range(xSize):
+        f = matrix[:, x]
+        d = dt(f, xSize)
+        matrix[:, x] = d
+
+smoothRho = 1
+cornerRho = 3
+step = 4
+flowVarianceGrad = 0.05
+flowVarianceConst = 2.5
+motionEdgeGrad = 0.05
+motionEdgeConst = 0.01
+cornerAlpha = 0.7
+input_a = movie[..., 0].copy()
+recursiveSmooth(input_a, smoothRho)
+input_b = None
+covered = np.zeros(movie.shape[:2])
+
+# seg = np.ones((h, w))
+
+def update_img(t):
+    global prevDrawList
+    global input_a
+    global input_b
+    global covered
+    global tracks
+
+    input_b = movie[..., t + 1].copy()
+    recursiveSmooth(input_b, smoothRho)
+
+    covered[...] = 1e20
+    if t > 0:
+        for track in tracks:
+            if track.stopped == False:
+                covered[int(track.my[-1]), int(track.mx[-1])] = 0
+        euclideanDistanceTransform(covered)
+
+    # corners = corner_harris(input_a, sigma=cornerRho) ** 2
+    # scale = (corners.min(), corners.max())
+    # corners = (corners - scale[0]) / (scale[1] - scale[0])
+    # corners = Image.fromarray((corners * 255).astype('uint8'))
+    # corners = np.array(ImageOps.equalize(corners))
+    # corners = corner_peaks(corners, min_distance=step)
+    # corners = corner_subpix(input_a, corners, window_size=(step * step) - 1, alpha=cornerAlpha)
+    # corners = corners[~np.isnan(corners[:, 0])]
+    # corners = corners.astype('int')
+    # corners = corners[covered[corners[:, 0], corners[:, 1]] > (step * step)]
+    # for (ax, ay) in corners:
+    #     tracks.append(Track(mox=ax, moy=ay, t=t))
+
+    # corners = computeCorners(input_a, cornerRho)
+    # corverAvg = np.mean(corners.flatten())
+    segmenter = ImageSegmenter()
+    seg = segmenter.Segment(input_a)
+    keras.backend.clear_session()
+    for ay in range(4, h - 4, step):
+        for ax in range(4, w - 4, step):
+            if covered[ay, ax] < (step * step) or seg[ay, ax] < 1:
+                continue
+            # distToImageBnd = np.exp(-0.1 * min(min(min(ax, ay), (w - ax)) , (h - ay)))
+            # if corners[ay, ax] < (corverAvg * (0.1 + distToImageBnd)):
+            #     continue
+            # if corners[ay, ax] < (1 + distToImageBnd):
+            #     continue
+            tracks.append(Track(mox=ax, moy=ay, t=t))
+
+    pred_flow_fwd = fnet.test(checkpoint=checkpoint, input_a=input_a, input_b=input_b, out_path='./', save_flo=True)
+    pred_flow_bk = fnet.test(checkpoint=checkpoint, input_a=input_b, input_b=input_a, out_path='./', save_flo=True)
+
+    goodTracks = np.ones((h, w))
+    dy, dx = np.gradient(pred_flow_fwd, axis=(0, 1))
+    motionEdge = (dx * dx).sum(axis=2) + (dy * dy).sum(axis=2)
+    for ay in range(h):
+        for ax in range(w):
+            bx = ax + pred_flow_fwd[ay, ax, 0]
+            by = ay + pred_flow_fwd[ay, ax, 1]
+            x1 = int(bx)
+            y1 = int(by)
+            x2 = x1 + 1
+            y2 = y1 + 1
+
+            if x1 < 0 or x2 >= w or y1 < 0 or y2 >= h:
+                goodTracks[ay, ax] = 0
+                continue
+
+            alphaX = bx - x1
+            alphaY = by - y1
+            
+            a = ((1 - alphaX) * pred_flow_bk[y1, x1, 0]) + (alphaX * pred_flow_bk[y1, x2, 0])
+            b = ((1 - alphaX) * pred_flow_bk[y2, x1, 0]) + (alphaX * pred_flow_bk[y2, x2, 0])
+            u = ((1 - alphaY) * a) + (alphaY * b)
+
+            a = ((1 - alphaX) * pred_flow_bk[y1, x1, 1]) + (alphaX * pred_flow_bk[y1, x2, 1])
+            b = ((1 - alphaX) * pred_flow_bk[y2, x1, 1]) + (alphaX * pred_flow_bk[y2, x2, 1])
+            v = ((1 - alphaY) * a) + (alphaY * b)
+
+            cx = bx + u
+            cy = by + v
+            u2 = pred_flow_fwd[ay, ax, 0]
+            v2 = pred_flow_fwd[ay, ax, 1]
+
+            if (((cx - ax) * (cx - ax)) + ((cy - ay) * (cy - ay))) >= ((flowVarianceGrad * ((u2 * u2) + (v2 * v2) + (u * u) + (v * v))) + flowVarianceConst):
+                goodTracks[ay, ax] = 0
+                continue
+
+            if motionEdge[ay, ax] > ((motionEdgeGrad * ((u2 * u2) + (v2 * v2))) + motionEdgeConst):
+                goodTracks[ay, ax] = 0
+
+    for track in tracks:
+        if track.stopped:
+            continue
+
+        if track.t == t:
+            ax = float(track.mox)
+            ay = float(track.moy)
+        else:
+            ax = track.mx[-1]
+            ay = track.my[-1]
+
+        iax = int(round(ax))
+        iay = int(round(ay))
+
+        if goodTracks[iay, iax] < 1:
+            track.stopped = True
+        else:
+            bx = ax + pred_flow_fwd[iay, iax, 0]
+            by = ay + pred_flow_fwd[iay, iax, 1]
+            ibx = round(bx)
+            iby = round(by)
+
+            if ibx < 0 or iby < 0 or ibx >= w or iby >= h:
+                track.stopped = True
+            else:
+                track.mx.append(bx)
+                track.my.append(by)
+
+    frameLabel = axes.annotate(t, (10, 10), color='yellow', size='large', bbox=boxProps_frame)
+
+    # im.set_data(movie[:, :, t])
+    im.set_data(input_a)
+
+    goodFlow = pred_flow_fwd * goodTracks[..., np.newaxis]
+    im2.set_data(flow_to_image(goodFlow))
+
+    lines = draw_flow_lines(goodFlow)
+    ax_lines = [axes.arrow(x1, y1, x2, y2, head_width=1, head_length=2, fc='yellow', ec='yellow') for (x1, y1), (x2, y2) in lines]
+
+    track_lines = draw_tracks(tracks, t + 1)
+    ax_lines += [axes.arrow(x1, y1, x2, y2, head_width=2, head_length=4, fc='green', ec='green') for (x1, y1), (x2, y2) in track_lines]
+
+    for patch in prevDrawList:
+        patch.remove()
+
+    prevDrawList = ax_lines + [frameLabel]
+    sys.stdout.write("Generating Movie File: {0:.2f}%".format(100.0 * (t + 1) / n) + '\r')
+    sys.stdout.flush()
+
+    input_a = input_b
+
+    return [im] + [im2] + ax_lines + [frameLabel]
+
+ani = animation.FuncAnimation(fig, update_img, frames=range(n-1), blit=True)
+writer = animation.writers['ffmpeg'](fps=fps)
+ani.save(name,writer=writer,dpi=dpi)
