@@ -1,0 +1,9 @@
+[submodule "keras-frcnn"]
+	path = keras-frcnn
+	url = https://github.com/EdHarry/keras-frcnn.git
+[submodule "flownet2-tf"]
+	path = flownet2-tf
+	url = https://github.com/EdHarry/flownet2-tf.git
+[submodule "crfasrnn_keras"]
+	path = crfasrnn_keras
+	url = https://github.com/EdHarry/crfasrnn_keras.git
